@@ -20,9 +20,15 @@
 
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include "yuv2rgb.h"
 #include "nclx.h"
 #include "common_utils.h"
+
+#if defined(__x86_64__) && defined(__GNUC__)
+#include <immintrin.h>
+#define HEIF_YUV2RGB_AVX2 1
+#endif
 
 
 template<class Pixel>
@@ -346,6 +352,67 @@ Op_YCbCr420_to_RGB24::state_after_conversion(const ColorState& input_state,
 // Rows y_begin..y_end of Op_YCbCr420_to_RGB24. Everything is passed by value:
 // the uint8_t writes could otherwise alias the coefficients and pointers, which
 // would then be reloaded for every pixel.
+
+#ifdef HEIF_YUV2RGB_AVX2
+// Byte shuffles interleaving 16 R, G and B samples into 48 RGB bytes: entry [3 * k + c]
+// places channel c into output block k.
+alignas(16) static const int8_t rgb24_interleave[9][16] = {
+  {0,-1,-1,1,-1,-1,2,-1,-1,3,-1,-1,4,-1,-1,5},
+  {-1,0,-1,-1,1,-1,-1,2,-1,-1,3,-1,-1,4,-1,-1},
+  {-1,-1,0,-1,-1,1,-1,-1,2,-1,-1,3,-1,-1,4,-1},
+  {-1,-1,6,-1,-1,7,-1,-1,8,-1,-1,9,-1,-1,10,-1},
+  {5,-1,-1,6,-1,-1,7,-1,-1,8,-1,-1,9,-1,-1,10},
+  {-1,5,-1,-1,6,-1,-1,7,-1,-1,8,-1,-1,9,-1,-1},
+  {-1,11,-1,-1,12,-1,-1,13,-1,-1,14,-1,-1,15,-1,-1},
+  {-1,-1,11,-1,-1,12,-1,-1,13,-1,-1,14,-1,-1,15,-1},
+  {10,-1,-1,11,-1,-1,12,-1,-1,13,-1,-1,14,-1,-1,15}
+};
+
+// Same arithmetic as the scalar loop, 16 pixels at a time: offsets in 32 bits with
+// the same rounding and arithmetic shift, the clip as an unsigned saturating pack.
+__attribute__((target("avx2")))
+static uint32_t ycbcr420_to_rgb24_row_avx2(uint32_t width, const uint8_t* y_row, const uint8_t* cb_row,
+                                           const uint8_t* cr_row, uint8_t* out_row,
+                                           int r_cr, int g_cr, int g_cb, int b_cb)
+{
+  const __m256i k_r_cr = _mm256_set1_epi32(r_cr), k_g_cr = _mm256_set1_epi32(g_cr);
+  const __m256i k_g_cb = _mm256_set1_epi32(g_cb), k_b_cb = _mm256_set1_epi32(b_cb);
+  const __m256i c128 = _mm256_set1_epi32(128);
+  const __m128i* m = reinterpret_cast<const __m128i*>(rgb24_interleave);
+  uint32_t x = 0;
+  for (; x + 16 <= width; x += 16) {
+    __m256i cb = _mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(cb_row + x / 2))), c128);
+    __m256i cr = _mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(cr_row + x / 2))), c128);
+    __m256i r = _mm256_srai_epi32(_mm256_add_epi32(_mm256_mullo_epi32(k_r_cr, cr), c128), 8);
+    __m256i g = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(_mm256_mullo_epi32(k_g_cb, cb), _mm256_mullo_epi32(k_g_cr, cr)), c128), 8);
+    __m256i b = _mm256_srai_epi32(_mm256_add_epi32(_mm256_mullo_epi32(k_b_cb, cb), c128), 8);
+    // [r0..7 | g0..7] and [b0..7 | b0..7] as int16
+    __m256i rg = _mm256_permute4x64_epi64(_mm256_packs_epi32(r, g), 0xD8);
+    __m256i bb = _mm256_permute4x64_epi64(_mm256_packs_epi32(b, b), 0xD8);
+    __m128i r8 = _mm256_castsi256_si128(rg), g8 = _mm256_extracti128_si256(rg, 1), b8 = _mm256_castsi256_si128(bb);
+    // each chroma offset covers two pixels
+    __m256i ro = _mm256_set_m128i(_mm_unpackhi_epi16(r8, r8), _mm_unpacklo_epi16(r8, r8));
+    __m256i go = _mm256_set_m128i(_mm_unpackhi_epi16(g8, g8), _mm_unpacklo_epi16(g8, g8));
+    __m256i bo = _mm256_set_m128i(_mm_unpackhi_epi16(b8, b8), _mm_unpacklo_epi16(b8, b8));
+    __m256i yv = _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(y_row + x)));
+    __m256i rr = _mm256_add_epi16(yv, ro), gg = _mm256_add_epi16(yv, go), bv = _mm256_add_epi16(yv, bo);
+    __m128i R = _mm_packus_epi16(_mm256_castsi256_si128(rr), _mm256_extracti128_si256(rr, 1));
+    __m128i G = _mm_packus_epi16(_mm256_castsi256_si128(gg), _mm256_extracti128_si256(gg, 1));
+    __m128i B = _mm_packus_epi16(_mm256_castsi256_si128(bv), _mm256_extracti128_si256(bv, 1));
+    uint8_t* o = out_row + 3 * x;
+    for (int k = 0; k < 3; k++) {
+      __m128i v = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(R, _mm_load_si128(m + 3 * k)),
+                                            _mm_shuffle_epi8(G, _mm_load_si128(m + 3 * k + 1))),
+                               _mm_shuffle_epi8(B, _mm_load_si128(m + 3 * k + 2)));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 16 * k), v);
+    }
+  }
+  return x;
+}
+
+static const bool have_avx2 = __builtin_cpu_supports("avx2");
+#endif
+
 static void ycbcr420_to_rgb24_rows(uint32_t y_begin, uint32_t y_end, uint32_t width,
                                    const uint8_t* in_y, size_t in_y_stride,
                                    const uint8_t* in_cb, size_t in_cb_stride,
@@ -366,7 +433,14 @@ static void ycbcr420_to_rgb24_rows(uint32_t y_begin, uint32_t y_end, uint32_t wi
     int g_offset = 0;
     int b_offset = 0;
 
-    for (uint32_t x = 0; x < width; x++) {
+    uint32_t x0 = 0;
+#ifdef HEIF_YUV2RGB_AVX2
+    if (have_avx2) {
+      x0 = ycbcr420_to_rgb24_row_avx2(width, y_row, cb_row, cr_row, out_row, r_cr, g_cr, g_cb, b_cb);
+    }
+#endif
+
+    for (uint32_t x = x0; x < width; x++) {
       // Update color offsets every other pixel
       if ((x & 1) == 0) {
         cb = cb_row[x / 2] - 128;
