@@ -566,9 +566,10 @@ Error HeifPixelImage::ComponentStorage::alloc(uint32_t width, uint32_t height, h
 
     // --- allocate memory
 
-  // Must zero-initialize: padding regions (stride, rounded_size(), alignment slack) are not
-  // written by decoders, so uninitialized contents would leak across decoded images.
-  allocated_mem = static_cast<uint8_t*>(std::calloc(1, allocation_size));
+  // Padding regions (stride, rounded_size(), alignment slack) are not written by decoders, so
+  // they are zeroed below: uninitialized contents would leak across decoded images. The visible
+  // width x height area is assumed to be written by whoever allocates the plane.
+  allocated_mem = static_cast<uint8_t*>(std::malloc(allocation_size));
   if (allocated_mem == nullptr) {
     std::stringstream sstr;
     sstr << "Allocating " << allocation_size << " bytes failed";
@@ -589,6 +590,16 @@ Error HeifPixelImage::ComponentStorage::alloc(uint32_t width, uint32_t height, h
   }
 
   mem = mem_8;
+
+  size_t row_bytes = static_cast<size_t>(width) * bytes_per_pixel;
+  memset(allocated_mem, 0, mem_8 - allocated_mem);
+  if (row_bytes < stride) {
+    for (uint32_t y = 0; y < height; y++) {
+      memset(mem_8 + y * stride + row_bytes, 0, stride - row_bytes);
+    }
+  }
+  uint8_t* rows_end = mem_8 + static_cast<size_t>(height) * stride;
+  memset(rows_end, 0, allocated_mem + allocation_size - rows_end);
 
   return Error::Ok;
 }
