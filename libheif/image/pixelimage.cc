@@ -1735,10 +1735,19 @@ void HeifPixelImage::ComponentStorage::rotate_ccw(int angle_degrees,
   size_t out_stride = out_plane.stride / sizeof(T);
   T* out_data = static_cast<T*>(out_plane.mem);
 
+  // 90 and 270 degrees transpose the plane. Done row by row, every write lands
+  // on another output row and misses the cache; in square blocks, the rows a
+  // block reads and writes stay cached while it is copied.
+  constexpr uint32_t block = 64;
+
   if (angle_degrees == 270) {
-    for (uint32_t x = 0; x < h; x++)
-      for (uint32_t y = 0; y < w; y++) {
-        out_data[y * out_stride + x] = in_data[(h - 1 - x) * in_stride + y];
+    for (uint32_t x0 = 0; x0 < h; x0 += block)
+      for (uint32_t y0 = 0; y0 < w; y0 += block) {
+        uint32_t x1 = std::min(x0 + block, h), y1 = std::min(y0 + block, w);
+        for (uint32_t x = x0; x < x1; x++)
+          for (uint32_t y = y0; y < y1; y++) {
+            out_data[y * out_stride + x] = in_data[(h - 1 - x) * in_stride + y];
+          }
       }
   } else if (angle_degrees == 180) {
     for (uint32_t y = 0; y < h; y++)
@@ -1746,9 +1755,13 @@ void HeifPixelImage::ComponentStorage::rotate_ccw(int angle_degrees,
         out_data[y * out_stride + x] = in_data[(h - 1 - y) * in_stride + (w - 1 - x)];
       }
   } else if (angle_degrees == 90) {
-    for (uint32_t x = 0; x < h; x++)
-      for (uint32_t y = 0; y < w; y++) {
-        out_data[y * out_stride + x] = in_data[x * in_stride + (w - 1 - y)];
+    for (uint32_t x0 = 0; x0 < h; x0 += block)
+      for (uint32_t y0 = 0; y0 < w; y0 += block) {
+        uint32_t x1 = std::min(x0 + block, h), y1 = std::min(y0 + block, w);
+        for (uint32_t x = x0; x < x1; x++)
+          for (uint32_t y = y0; y < y1; y++) {
+            out_data[y * out_stride + x] = in_data[x * in_stride + (w - 1 - y)];
+          }
       }
   }
 }
