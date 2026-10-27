@@ -1722,6 +1722,30 @@ Result<std::shared_ptr<HeifPixelImage>> HeifPixelImage::rotate_ccw(int angle_deg
   return out_img;
 }
 
+// Columns x_begin..x_end of a 90 or 270 degree rotation of a w x h plane, in
+// square blocks (see ComponentStorage::rotate_ccw). Parameters are passed by
+// value so that the writes cannot alias them.
+template <typename T, int angle>
+static void rotate_blocks(const T* in_data, size_t in_stride, T* out_data, size_t out_stride,
+                          uint32_t w, uint32_t h, uint32_t x_begin, uint32_t x_end)
+{
+  constexpr uint32_t block = 64;
+  for (uint32_t x0 = x_begin; x0 < x_end; x0 += block)
+    for (uint32_t y0 = 0; y0 < w; y0 += block) {
+      uint32_t x1 = std::min(x0 + block, x_end), y1 = std::min(y0 + block, w);
+      for (uint32_t x = x0; x < x1; x++)
+        for (uint32_t y = y0; y < y1; y++) {
+          if constexpr (angle == 270) {
+            out_data[y * out_stride + x] = in_data[(h - 1 - x) * in_stride + y];
+          }
+          else {
+            out_data[y * out_stride + x] = in_data[x * in_stride + (w - 1 - y)];
+          }
+        }
+    }
+}
+
+
 template<typename T>
 void HeifPixelImage::ComponentStorage::rotate_ccw(int angle_degrees,
                                             ComponentStorage& out_plane) const
@@ -1741,28 +1765,20 @@ void HeifPixelImage::ComponentStorage::rotate_ccw(int angle_degrees,
   constexpr uint32_t block = 64;
 
   if (angle_degrees == 270) {
-    for (uint32_t x0 = 0; x0 < h; x0 += block)
-      for (uint32_t y0 = 0; y0 < w; y0 += block) {
-        uint32_t x1 = std::min(x0 + block, h), y1 = std::min(y0 + block, w);
-        for (uint32_t x = x0; x < x1; x++)
-          for (uint32_t y = y0; y < y1; y++) {
-            out_data[y * out_stride + x] = in_data[(h - 1 - x) * in_stride + y];
-          }
-      }
+    // Each slice of blocks writes its own output columns.
+    parallel_slices((h + block - 1) / block, 1, [=](uint32_t b_begin, uint32_t b_end) {
+      rotate_blocks<T, 270>(in_data, in_stride, out_data, out_stride, w, h, b_begin * block, std::min(h, b_end * block));
+    });
   } else if (angle_degrees == 180) {
     for (uint32_t y = 0; y < h; y++)
       for (uint32_t x = 0; x < w; x++) {
         out_data[y * out_stride + x] = in_data[(h - 1 - y) * in_stride + (w - 1 - x)];
       }
   } else if (angle_degrees == 90) {
-    for (uint32_t x0 = 0; x0 < h; x0 += block)
-      for (uint32_t y0 = 0; y0 < w; y0 += block) {
-        uint32_t x1 = std::min(x0 + block, h), y1 = std::min(y0 + block, w);
-        for (uint32_t x = x0; x < x1; x++)
-          for (uint32_t y = y0; y < y1; y++) {
-            out_data[y * out_stride + x] = in_data[x * in_stride + (w - 1 - y)];
-          }
-      }
+    // Each slice of blocks writes its own output columns.
+    parallel_slices((h + block - 1) / block, 1, [=](uint32_t b_begin, uint32_t b_end) {
+      rotate_blocks<T, 90>(in_data, in_stride, out_data, out_stride, w, h, b_begin * block, std::min(h, b_end * block));
+    });
   }
 }
 
