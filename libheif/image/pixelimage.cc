@@ -1736,6 +1736,36 @@ Result<std::shared_ptr<HeifPixelImage>> HeifPixelImage::rotate_ccw(int angle_deg
 // Columns x_begin..x_end of a 90 or 270 degree rotation of a w x h plane, in
 // square blocks (see ComponentStorage::rotate_ccw). Parameters are passed by
 // value so that the writes cannot alias them.
+#if defined(__SSE2__)
+#include <emmintrin.h>
+// In-place transpose of 16 rows of 16 bytes: four rounds of interleaving.
+static inline void transpose16x16_u8(__m128i r[16])
+{
+  __m128i t[16];
+  for (int i = 0; i < 8; i++) {
+    t[i] = _mm_unpacklo_epi8(r[2 * i], r[2 * i + 1]);
+    t[i + 8] = _mm_unpackhi_epi8(r[2 * i], r[2 * i + 1]);
+  }
+  for (int i = 0; i < 4; i++) {
+    r[i] = _mm_unpacklo_epi16(t[2 * i], t[2 * i + 1]);
+    r[i + 4] = _mm_unpackhi_epi16(t[2 * i], t[2 * i + 1]);
+    r[i + 8] = _mm_unpacklo_epi16(t[8 + 2 * i], t[8 + 2 * i + 1]);
+    r[i + 12] = _mm_unpackhi_epi16(t[8 + 2 * i], t[8 + 2 * i + 1]);
+  }
+  for (int g = 0; g < 4; g++)
+    for (int i = 0; i < 2; i++) {
+      t[4 * g + i] = _mm_unpacklo_epi32(r[4 * g + 2 * i], r[4 * g + 2 * i + 1]);
+      t[4 * g + i + 2] = _mm_unpackhi_epi32(r[4 * g + 2 * i], r[4 * g + 2 * i + 1]);
+    }
+  for (int g = 0; g < 4; g++) {
+    r[4 * g] = _mm_unpacklo_epi64(t[4 * g], t[4 * g + 1]);
+    r[4 * g + 1] = _mm_unpackhi_epi64(t[4 * g], t[4 * g + 1]);
+    r[4 * g + 2] = _mm_unpacklo_epi64(t[4 * g + 2], t[4 * g + 3]);
+    r[4 * g + 3] = _mm_unpackhi_epi64(t[4 * g + 2], t[4 * g + 3]);
+  }
+}
+#endif
+
 template <typename T, int angle>
 static void rotate_blocks(const T* in_data, size_t in_stride, T* out_data, size_t out_stride,
                           uint32_t w, uint32_t h, uint32_t x_begin, uint32_t x_end)
@@ -1744,6 +1774,28 @@ static void rotate_blocks(const T* in_data, size_t in_stride, T* out_data, size_
   for (uint32_t x0 = x_begin; x0 < x_end; x0 += block)
     for (uint32_t y0 = 0; y0 < w; y0 += block) {
       uint32_t x1 = std::min(x0 + block, x_end), y1 = std::min(y0 + block, w);
+#if defined(__SSE2__)
+      if constexpr (sizeof(T) == 1) {
+        if (x1 - x0 == block && y1 - y0 == block) {
+          for (uint32_t x = x0; x < x1; x += 16)
+            for (uint32_t y = y0; y < y1; y += 16) {
+              __m128i r[16];
+              for (int i = 0; i < 16; i++) {
+                const uint8_t* src = (angle == 270) ? reinterpret_cast<const uint8_t*>(in_data) + (h - 1 - x - i) * in_stride + y
+                                                    : reinterpret_cast<const uint8_t*>(in_data) + (x + i) * in_stride + (w - 16 - y);
+                r[i] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+              }
+              transpose16x16_u8(r);
+              for (int j = 0; j < 16; j++) {
+                // 270: transposed row j is output row y + j; 90: it is output row y + 15 - j
+                uint32_t oy = (angle == 270) ? y + j : y + 15 - j;
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(reinterpret_cast<uint8_t*>(out_data) + oy * out_stride + x), r[j]);
+              }
+            }
+          continue;
+        }
+      }
+#endif
       for (uint32_t x = x0; x < x1; x++)
         for (uint32_t y = y0; y < y1; y++) {
           if constexpr (angle == 270) {
