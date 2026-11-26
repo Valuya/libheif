@@ -23,6 +23,8 @@
 
 #include <cinttypes>
 #include <string>
+#include <algorithm>
+#include <thread>
 #include <vector>
 
 #include "libheif/heif.h"
@@ -122,5 +124,35 @@ inline uint8_t clip_f_u8(float fx)
 }
 
 Result<std::string> vector_to_string(const std::vector<uint8_t>& vec);
+
+
+// Threads that whole-image passes (colour conversion, rotation) may use in the
+// current decode; HeifContext::decode_image sets it from the context's maximum
+// number of decoding threads.
+extern thread_local int heif_image_pass_threads;
+
+// Calls f(begin, end) on consecutive slices of [0, n), at most
+// heif_image_pass_threads at once and none smaller than min_slice, the first
+// on the calling thread. Slices must be independent.
+template <typename F>
+void parallel_slices(uint32_t n, uint32_t min_slice, F&& f)
+{
+  uint32_t threads = static_cast<uint32_t>(std::max(1, heif_image_pass_threads));
+  threads = std::min(threads, std::max(1u, n / std::max(1u, min_slice)));
+  if (threads <= 1) {
+    f(0u, n);
+    return;
+  }
+  uint32_t chunk = (n + threads - 1) / threads;
+  std::vector<std::thread> workers;
+  for (uint32_t begin = chunk; begin < n; begin += chunk) {
+    uint32_t end = std::min(n, begin + chunk);
+    workers.emplace_back([&f, begin, end] { f(begin, end); });
+  }
+  f(0u, std::min(n, chunk));
+  for (auto& w : workers) {
+    w.join();
+  }
+}
 
 #endif //LIBHEIF_COMMON_UTILS_H

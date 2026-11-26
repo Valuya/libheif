@@ -343,6 +343,49 @@ Op_YCbCr420_to_RGB24::state_after_conversion(const ColorState& input_state,
 }
 
 
+// Rows y_begin..y_end of Op_YCbCr420_to_RGB24. Everything is passed by value:
+// the uint8_t writes could otherwise alias the coefficients and pointers, which
+// would then be reloaded for every pixel.
+static void ycbcr420_to_rgb24_rows(uint32_t y_begin, uint32_t y_end, uint32_t width,
+                                   const uint8_t* in_y, size_t in_y_stride,
+                                   const uint8_t* in_cb, size_t in_cb_stride,
+                                   const uint8_t* in_cr, size_t in_cr_stride,
+                                   uint8_t* out_p, size_t out_p_stride,
+                                   int r_cr, int g_cr, int g_cb, int b_cb)
+{
+  for (uint32_t y = y_begin; y < y_end; y++) {
+    // Row pointers for input and output
+    const uint8_t* y_row = &in_y[y * in_y_stride];
+    const uint8_t* cb_row = &in_cb[(y / 2) * in_cb_stride];
+    const uint8_t* cr_row = &in_cr[(y / 2) * in_cr_stride];
+    uint8_t* out_row = &out_p[y * out_p_stride];
+
+    int cb = 0;
+    int cr = 0;
+    int r_offset = 0;
+    int g_offset = 0;
+    int b_offset = 0;
+
+    for (uint32_t x = 0; x < width; x++) {
+      // Update color offsets every other pixel
+      if ((x & 1) == 0) {
+        cb = cb_row[x / 2] - 128;
+        cr = cr_row[x / 2] - 128;
+        r_offset = ((r_cr * cr + 128) >> 8);
+        g_offset = ((g_cb * cb + g_cr * cr + 128) >> 8);
+        b_offset = ((b_cb * cb + 128) >> 8);
+      }
+
+      int yv = y_row[x];
+      uint8_t* rgb = &out_row[3 * x];
+      rgb[0] = clip_int_u8(yv + r_offset);
+      rgb[1] = clip_int_u8(yv + g_offset);
+      rgb[2] = clip_int_u8(yv + b_offset);
+    }
+  }
+}
+
+
 Result<std::shared_ptr<HeifPixelImage>>
 Op_YCbCr420_to_RGB24::convert_colorspace(const std::shared_ptr<const HeifPixelImage>& input,
                                          const ColorState& input_state,
@@ -391,37 +434,11 @@ Op_YCbCr420_to_RGB24::convert_colorspace(const std::shared_ptr<const HeifPixelIm
   in_cr = input->get_channel_memory(heif_channel_Cr, &in_cr_stride);
   out_p = outimg->get_channel_memory(heif_channel_interleaved, &out_p_stride);
 
-  uint32_t x, y;
-  for (y = 0; y < height; y++) {
-    // Row pointers for input and output
-    const uint8_t* y_row = &in_y[y * in_y_stride];
-    const uint8_t* cb_row = &in_cb[(y / 2) * in_cb_stride];
-    const uint8_t* cr_row = &in_cr[(y / 2) * in_cr_stride];
-    uint8_t* out_row = &out_p[y * out_p_stride];
-
-    int cb = 0;
-    int cr = 0;
-    int r_offset = 0;
-    int g_offset = 0;
-    int b_offset = 0;
-
-    for (x = 0; x < width; x++) {
-      // Update color offsets every other pixel
-      if ((x & 1) == 0) {
-        cb = cb_row[x / 2] - 128;
-        cr = cr_row[x / 2] - 128;
-        r_offset = ((r_cr * cr + 128) >> 8);
-        g_offset = ((g_cb * cb + g_cr * cr + 128) >> 8);
-        b_offset = ((b_cb * cb + 128) >> 8);
-      }
-
-      int yv = y_row[x];
-      uint8_t* rgb = &out_row[3 * x];
-      rgb[0] = clip_int_u8(yv + r_offset);
-      rgb[1] = clip_int_u8(yv + g_offset);
-      rgb[2] = clip_int_u8(yv + b_offset);
-    }
-  }
+  // Rows are independent: each reads its own luma row and chroma row y / 2.
+  parallel_slices(height, 16, [=](uint32_t y_begin, uint32_t y_end) {
+    ycbcr420_to_rgb24_rows(y_begin, y_end, width, in_y, in_y_stride, in_cb, in_cb_stride, in_cr, in_cr_stride,
+                           out_p, out_p_stride, r_cr, g_cr, g_cb, b_cb);
+  });
 
   return outimg;
 }

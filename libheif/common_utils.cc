@@ -189,3 +189,6 @@ Result<std::string> vector_to_string(const std::vector<uint8_t>& vec)
 
   return std::string(vec.begin(), vec.end()-1);
 }
+
+
+thread_local int heif_image_pass_threads = 1;

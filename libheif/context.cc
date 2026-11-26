@@ -1505,6 +1505,8 @@ Result<std::shared_ptr<HeifPixelImage>> HeifContext::decode_image(heif_item_id I
     return Error(heif_error_Invalid_input, heif_suberror_Nonexisting_item_referenced);
   }
 
+  heif_image_pass_threads = std::max(1, get_max_decoding_threads());
+
   // Reject un-decodable inputs before any decoding starts. In particular, a
   // cycle in the decode reference graph ('dimg' inputs or the alpha 'auxl'
   // edge) would let two parallel grid-tile workers take two item mutexes in
